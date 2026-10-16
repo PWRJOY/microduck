@@ -7,4 +7,10 @@ description = "FeeTech (SCS/HD-1910) RobotIo backend for MicroDuck"
 
 [dependencies]
 # 纯协议层 `wire` 只处理字节，不依赖任何外部 crate，因此在开发机上即可离线单测。
-# 从 `bus` 阶段起再引入 duck-control（实现 RobotIo）与 serialport（打开串口）。
+# `bus` 实现 duck-control 的 RobotIo 接缝：读路径复用官方 `SflpDecoder` 与 Sensors 类型，
+# 不复制官方代码；串口用 serialport。
+duck-control = { path = "../duck-control" }
+# 与 duck-control / rustypot 保持同一大版本，且必须 default-features = false：
+# 去掉只用于枚举端口的 libudev feature，否则 aarch64 板子上原生编译会因缺 sysroot 失败。
+serialport = { version = "4.8", default-features = false }
+tracing.workspace = true

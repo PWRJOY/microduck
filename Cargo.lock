@@ -1172,6 +1172,11 @@ dependencies = [
 [[package]]
 name = "duck_ft1910"
 version = "0.17.4"
+dependencies = [
+ "duck-control",
+ "serialport",
+ "tracing",
+]
 
 [[package]]
 name = "duckctl"
