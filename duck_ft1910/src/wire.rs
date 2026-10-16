@@ -114,14 +114,72 @@ pub mod gains_block {
 /// 前 12 字节是飞特人格下的陀螺 xyz + SFLP 四元数 xyz，再后面是帧计数和状态字节。
 /// 具体解码在后续的 `imu` 模块，这里先把协议布局钉死。
 pub mod imu_block {
+    /// 前 12 字节：陀螺仪 i16×3（0..6）+ 半精度四元数 x/y/z（6..12），与官方 v2 板同格式。
     pub const CTRL_LEN: usize = 12;
-    /// 帧计数，回绕；计数不变代表这一帧没刷新。
+    /// 帧计数，回绕；ft6 语义是「四元数序号」，native 是「采样计数」。不变代表这一帧没刷新。
     pub const COUNT: usize = 12;
+    /// 状态字节，位含义随固件人格而不同（见 [`ft6_status`] / [`native_status`]）。
     pub const STATUS: usize = 13;
+    /// 保留字节，规格要求恒为 0。
+    pub const RESERVED: usize = 14;
+    /// 飞特人格整块长度（地址 56 读 15 字节）。
+    pub const LEN: usize = 15;
 }
 
-/// [`imu_block::STATUS`] 里的 SFLP 有效位：芯片已产出融合结果。
-pub const IMU_FLAG_SFLP_VALID: u8 = 0x01;
+/// ID 200 寄存器 0..4 的身份窗，用来区分固件人格（固件 v1.6.0 起默认 ft6，v1.4.x 是 native）。
+///
+/// 判据照 servo-web `imu_bus.py` 的 `detect_personality`：ft6 应答 `06 00 00 00 F2`
+/// （FW6.0 + 型号 0xF200），native 应答 `01 00 00 49 4D`。
+pub mod imu_identity {
+    /// 身份窗起始寄存器。
+    pub const ADDR: u8 = 0;
+    /// 身份窗长度（寄存器 0..4）。
+    pub const LEN: u8 = 5;
+    /// ft6 人格应答。
+    pub const FT6: [u8; LEN as usize] = [0x06, 0x00, 0x00, 0x00, 0xF2];
+    /// community-kit native 人格应答。
+    pub const NATIVE: [u8; LEN as usize] = [0x01, 0x00, 0x00, 0x49, 0x4D];
+}
+
+/// ft6 人格 byte13 状态位（FEE_ST_*，协议 §16）。
+///
+/// 注意 bit0 极性与 native 相反：ft6 置 1 表示「未就绪」。
+pub mod ft6_status {
+    /// 融合未出数 / 四元数全 0（置 1 = 未就绪）。
+    pub const NOT_READY: u8 = 0x01;
+    /// 四元数年龄 > 30ms（发送时计算）。
+    pub const STALE: u8 = 0x02;
+    /// 传感器错误（真故障：LSM6DSV16X 通信/数据异常）。
+    pub const SENSOR_ERR: u8 = 0x04;
+    /// 距上次读取新增 ≥5 个四元数（信息位：主机读太慢，不致命，不参与就绪判定）。
+    pub const READER_SLOW: u8 = 0x08;
+    /// bit0/1/2 全为 0 才算就绪；bit3 不参与。
+    pub const READY_MASK: u8 = 0x07;
+    /// bits4-7 恒为 0，非 0 即块形状错误。
+    pub const SHAPE_MASK: u8 = 0xF0;
+}
+
+/// community-kit native 人格 byte13 状态位（TELEM_FLAG_*，GD32 固件 board.h）。
+///
+/// 与 ft6 极性相反：0x01 / 0x80 是好事，0x08 才是真故障。
+pub mod native_status {
+    /// 本块带有效姿态（好事）。
+    pub const SFLP_VALID: u8 = 0x01;
+    /// u8 采样计数刚回绕（100Hz 下每 2.55s 一次，正常）。
+    pub const CNT_WRAP: u8 = 0x02;
+    /// 陀螺仪饱和（瞬时过载，不致命）。
+    pub const GYRO_SAT: u8 = 0x04;
+    /// 传感器错误（真故障）。
+    pub const SENSOR_ERR: u8 = 0x08;
+    /// 数据来自模拟器。
+    pub const SIMULATED: u8 = 0x10;
+    /// 固件认为数据不再变化。
+    pub const FROZEN: u8 = 0x20;
+    /// 配置未保存。
+    pub const CFG_DIRTY: u8 = 0x40;
+    /// 融合算法运行中（好事）。
+    pub const FUSION_OK: u8 = 0x80;
+}
 
 pub const BROADCAST_ID: u8 = 0xFE;
 /// 协议能产生的最大帧（LEN 是 u8）。

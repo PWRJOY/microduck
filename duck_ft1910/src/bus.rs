@@ -26,7 +26,10 @@ use duck_control::imu::{SflpDecoder, IMU_BLOCK_LEN};
 use duck_control::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
 use duck_control::model::{JOINT_IDS, JOINT_NAMES, MOUTH_INDEX, NUM_JOINTS};
 
-use crate::wire::{self, block, gains_block, imu_block, reg, ExpectedReply, FrameReader};
+use crate::wire::{
+    self, block, ft6_status, gains_block, imu_block, imu_identity, native_status, reg,
+    ExpectedReply, FrameReader,
+};
 
 // ── 总线时序常量 ─────────────────────────────────────────────────────────────
 
@@ -111,7 +114,22 @@ impl PdProfile {
     }
 }
 
-/// 整机标定：IMU 地址、15 个关节的零位/方向、增益档位、IMU 安装朝向、波特率。
+/// IMU 固件人格：状态字节位定义、就绪判据和安装朝向随人格而不同。
+///
+/// 我们的社区 IMU 板刷的是 ft6 v1.6.0 固件，默认 [`ImuPersonality::Ft6`]；
+/// 人格也可由 [`Ft1910Io::detect_personality`] 读 ID 200 身份窗自动识别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImuPersonality {
+    /// 飞特 ft6 人格（v1.6.0 起默认）：就绪 = (byte13 & 0x07)==0；12 个控制字节已在板端
+    /// 做安装预旋转，主机 mount 用单位四元数。
+    #[default]
+    Ft6,
+    /// community-kit native 人格（v1.4.x 契约）：byte13 的 0x01/0x80 是好事，就绪靠
+    /// 官方解码器累计有效四元数；状态位极性与 ft6 相反。
+    Native,
+}
+
+/// 整机标定：IMU 地址/人格、15 个关节的零位/方向、增益档位、IMU 安装朝向、波特率。
 #[derive(Debug, Clone, Copy)]
 pub struct Calibration {
     /// IMU 在总线上的舵机 id（伪装成舵机）。
@@ -119,11 +137,12 @@ pub struct Calibration {
     pub joints: [JointCalibration; NUM_JOINTS],
     /// 飞特 RAM P/D 增益档位（可在配置文件里覆盖）。
     pub pd: PdProfile,
+    /// IMU 固件人格（我们的板子默认 ft6 v1.6.0）。
+    pub imu_personality: ImuPersonality,
     /// IMU 安装四元数 `[w, x, y, z]`，把板载坐标系转到躯干坐标系。
     ///
     /// ft6 固件（v1.6.0）已在**板端**做了安装预旋转（X、Y 反向，输出即躯干坐标），
-    /// 主机端不再施加旋转，所以用单位四元数。该结论与 servo-web 前端直读板端四元数、
-    /// 3D 姿态正确一致；#19 上板再做最终复核。
+    /// 主机端不再施加旋转，所以用单位四元数。
     pub imu_mount: [f64; 4],
     pub baud_rate: u32,
 }
@@ -134,6 +153,7 @@ impl Default for Calibration {
             imu_id: 200,
             joints: array::from_fn(|_| JointCalibration::default()),
             pd: PdProfile::default(),
+            imu_personality: ImuPersonality::default(),
             imu_mount: [1.0, 0.0, 0.0, 0.0],
             baud_rate: BAUD_RATE,
         }
@@ -197,15 +217,32 @@ impl Transport for SerialTransport {
 
 // ── IMU 陈旧计数 ─────────────────────────────────────────────────────────────
 
-/// 跟踪 IMU 帧序号：序号原地踏步说明姿态没有刷新（板端冻结或读取太慢）。
+/// 前 12 字节连续多少帧完全相同就判姿态冻结（50Hz 下半秒），沿用官方 STALE_RUN_WARN。
+const FROZEN_RUN: u64 = 25;
+/// ft6 四元数序号连续 3 个相同（= 2 次重复）即判节点不再出姿态（协议 §16.3）。
+const FT6_SEQ_STALE_RUN: u64 = 2;
+
+/// 跟踪 IMU 是否在刷新。上报口径严格对齐官方 `StaleImuTracker` / [`ImuStale`]：只比
+/// **前 12 字节窗口**（陀螺 + 四元数，不含 byte12 序号）。
 ///
-/// 这里先用相邻两帧序号相等即计一次陈旧（社区版做法）；ft6 要求连续 3 次相同才判 stale
-/// 的更细判据在 #19 落地。
+/// * `stale_total`：陈旧读数累计——只有当前块与上一块前 12 字节逐字节相同才 +1，第一块
+///   不计数、永不复位；对应 [`ImuStale::total`]。
+/// * `window_run`：当前连续重复长度，任一新鲜块归零；对应 [`ImuStale::run`]，上层用
+///   `FROZEN_RUN` 判姿态冻结。
+///
+/// 另有一路 ft6 独有的 `seq_run`：四元数序号（byte12）连续相同长度，比窗口更早发现板端
+/// 停发（连续 3 个即过期，§16.3）。它只驱动 ft6 分支的 `tracing::warn`，**不进 [`ImuStale`]**：
+/// 上层 `FROZEN_RUN` 阈值是按窗口重复标定的，把序号塞进去会让健康指标含义错乱。
 #[derive(Debug, Default)]
 struct StaleTracker {
-    count: Option<u8>,
-    total: u64,
-    run: u64,
+    /// 前 12 字节窗口重复累计次数（= ImuStale.total），仅重复时累加，永不复位。
+    stale_total: u64,
+    last_seq: Option<u8>,
+    /// 四元数序号连续重复长度（仅用于 ft6 §16.3 的 warn）。
+    seq_run: u64,
+    last_window: Option<[u8; IMU_BLOCK_LEN]>,
+    /// 前 12 字节连续重复长度（= ImuStale.run）。
+    window_run: u64,
 }
 
 impl StaleTracker {
@@ -213,22 +250,29 @@ impl StaleTracker {
         Self::default()
     }
 
-    fn observe(&mut self, _raw: &[u8; IMU_BLOCK_LEN], count: Option<u8>) {
-        self.total += 1;
-        if let Some(count) = count {
-            if self.count == Some(count) {
-                self.run += 1;
-            } else {
-                self.count = Some(count);
-                self.run = 0;
-            }
+    /// 观测一帧：返回 (序号重复 run, 窗口重复 run)，新鲜均为 0。
+    fn observe(&mut self, window: &[u8; IMU_BLOCK_LEN], seq: u8) -> (u64, u64) {
+        if self.last_seq == Some(seq) {
+            self.seq_run = self.seq_run.saturating_add(1);
+        } else {
+            self.last_seq = Some(seq);
+            self.seq_run = 0;
         }
+        if self.last_window == Some(*window) {
+            self.stale_total = self.stale_total.saturating_add(1);
+            self.window_run = self.window_run.saturating_add(1);
+        } else {
+            self.last_window = Some(*window);
+            self.window_run = 0;
+        }
+        (self.seq_run, self.window_run)
     }
 
+    /// 上报给控制环：严格对齐官方 [`ImuStale`] 的前 12 字节窗口语义。
     fn snapshot(&self) -> ImuStale {
         ImuStale {
-            total: self.total,
-            run: self.run,
+            total: self.stale_total,
+            run: self.window_run,
         }
     }
 }
@@ -245,7 +289,11 @@ pub struct Ft1910Io {
     ids: Vec<u8>,
     decoder: SflpDecoder,
     stale: StaleTracker,
+    /// 当前按哪种固件人格解析状态字节。
+    personality: ImuPersonality,
     imu_status: u8,
+    /// 最近一帧 IMU 是否就绪（ft6 由状态位决定，native 由解码器有效四元数计数决定）。
+    imu_ready_flag: bool,
     /// 最近一次写入的策略增益（XL330 单位）。初始为 0，确保第一次 `set_gain` 一定真的下发。
     gain: u16,
     /// 每颗舵机 RAM 里的 P/D 是否确实等于当前 profile；舵机重启、检测到漂移、写失败都会
@@ -289,7 +337,9 @@ impl Ft1910Io {
             ids,
             decoder: SflpDecoder::new(calibration.imu_mount),
             stale: StaleTracker::new(),
+            personality: calibration.imu_personality,
             imu_status: 0,
+            imu_ready_flag: false,
             gain: 0,
             gains_verified: false,
             enabled: false,
@@ -412,6 +462,32 @@ impl Ft1910Io {
         self.request(&frame, &expected)
     }
 
+    /// 读 IMU 节点寄存器 0..4 的身份窗，识别并记住固件人格。
+    ///
+    /// ft6 应答 `06 00 00 00 F2`、native 应答 `01 00 00 49 4D`。读不到或无法识别时返回
+    /// 错误且不改变当前人格（构造时按标定文件的 `imu_personality`，默认 ft6）。这是一次
+    /// 额外的总线读，默认不自动调用，交给上层在需要时显式识别。
+    pub fn detect_personality(&mut self) -> Result<ImuPersonality> {
+        let id = self.calibration.imu_id;
+        let frame = wire::read(id, imu_identity::ADDR, imu_identity::LEN);
+        let expected = ExpectedReply::new(&[id], imu_identity::LEN as usize);
+        let blocks = self.request(&frame, &expected)?;
+        let ident = blocks[0].as_slice();
+        let personality = if ident == imu_identity::FT6.as_slice() {
+            ImuPersonality::Ft6
+        } else if ident == imu_identity::NATIVE.as_slice() {
+            ImuPersonality::Native
+        } else {
+            return Err(IoError::Bus(format!(
+                "无法识别 IMU 身份窗：{ident:02x?}（ft6 应为 {:02x?}，native 应为 {:02x?}）",
+                imu_identity::FT6, imu_identity::NATIVE
+            )));
+        };
+        self.personality = personality;
+        tracing::info!(?personality, "识别到 IMU 固件人格");
+        Ok(personality)
+    }
+
     /// 当前 profile + 最新策略增益下，每个关节应写入的 `[P, D]`。
     fn want_gains(&self) -> Vec<[u8; 2]> {
         (0..NUM_JOINTS)
@@ -514,12 +590,13 @@ impl RobotIo for Ft1910Io {
 
         let mut sensors = Sensors::default();
 
-        // 第一个块是 IMU：前 12 字节直接交给官方解码器（陀螺 + 半精度四元数）。
+        // 第一个块是 IMU（地址 56、15 字节）：前 12 字节（陀螺 + 半精度四元数）格式与官方
+        // v2 板相同，直接交给官方解码器；byte12/13/14 是飞特人格特有的序号/状态/保留。
         let imu = &blocks[0];
-        if imu.len() < IMU_BLOCK_LEN {
+        if imu.len() < imu_block::LEN {
             return Err(IoError::ShortRead {
                 what: "IMU 控制块",
-                expected: IMU_BLOCK_LEN,
+                expected: imu_block::LEN,
                 got: imu.len(),
             });
         }
@@ -527,9 +604,71 @@ impl RobotIo for Ft1910Io {
         raw.copy_from_slice(&imu[..IMU_BLOCK_LEN]);
         let status = imu[imu_block::STATUS];
         let count = imu[imu_block::COUNT];
-        self.stale.observe(&raw, Some(count));
-        sensors.imu = self.decoder.decode(&raw);
+        let reserved = imu[imu_block::RESERVED];
         self.imu_status = status;
+
+        // 陈旧统计先于形状校验：即便块畸形也记一次窗口/序号（与 Python 参考实现一致）。
+        let (seq_run, window_run) = self.stale.observe(&raw, count);
+        // 板端还没写出 SFLP 表时，四元数 6 字节（raw[6..12]）全 0。
+        let quat_all_zero = imu[6..imu_block::CTRL_LEN].iter().all(|b| *b == 0);
+
+        // 形状校验在前：畸形块直接 Err，且不交给解码器，避免垃圾四元数污染中值滤波。
+        let mut native_sensor_err = false;
+        match self.personality {
+            ImuPersonality::Ft6 => {
+                // 形状：reserved 必须 0、状态高 4 位必须 0，否则按 §16.3 拒绝整块。
+                if reserved != 0 || (status & ft6_status::SHAPE_MASK) != 0 {
+                    return Err(IoError::Bus(format!(
+                        "IMU ft6 块形状错误：reserved=0x{reserved:02x}（要求 0）、状态高4位=0x{:01x}（要求 0），拒绝整块",
+                        status & ft6_status::SHAPE_MASK
+                    )));
+                }
+                if status & ft6_status::SENSOR_ERR != 0 {
+                    tracing::error!(
+                        status,
+                        "IMU 报告传感器错误（ft6 bit2 SENSOR_ERR）：LSM6DSV16X 通信/数据异常"
+                    );
+                }
+                // ready = bit0/1/2 全 0 且四元数非全 0；bit3 READER_SLOW 是信息位，不参与。
+                self.imu_ready_flag = (status & ft6_status::READY_MASK) == 0 && !quat_all_zero;
+                if seq_run == FT6_SEQ_STALE_RUN
+                    || (seq_run > FT6_SEQ_STALE_RUN && seq_run.is_multiple_of(500))
+                {
+                    tracing::warn!(
+                        consecutive = seq_run,
+                        "IMU 四元数序号连续相同，节点不再产生新姿态（ft6 §16.3）"
+                    );
+                }
+            }
+            ImuPersonality::Native => {
+                if reserved != 0 {
+                    return Err(IoError::Bus(format!(
+                        "IMU 保留字节 = 0x{reserved:02x}，规格要求 0"
+                    )));
+                }
+                native_sensor_err = status & native_status::SENSOR_ERR != 0;
+                if native_sensor_err {
+                    tracing::error!(status, "IMU 报告传感器错误（native SENSOR_ERR）");
+                }
+            }
+        }
+
+        // 只有通过形状校验的合法块才交给解码器：全 0 四元数时它沿用上一帧姿态，不谎报直立。
+        sensors.imu = self.decoder.decode(&raw);
+        if self.personality == ImuPersonality::Native {
+            // native 没有可靠的 ready 位（0x01/0x80 是好事），沿用官方解码器：累计满 25 个
+            // 有效四元数，全 0 未出表时解码器本身不计数；SENSOR_ERR 与 ft6 一样 gate 就绪。
+            self.imu_ready_flag = self.decoder.ready() && !quat_all_zero && !native_sensor_err;
+        }
+
+        // 前 12 字节冻结检测（两种人格共用）：到阈值报一次，之后每 500 帧报一次。
+        if window_run == FROZEN_RUN || (window_run > FROZEN_RUN && window_run.is_multiple_of(500))
+        {
+            tracing::warn!(
+                consecutive = window_run,
+                "IMU 前 12 字节连续相同，姿态冻结（orientation is frozen）"
+            );
+        }
 
         // 其余 15 块按关节表顺序填充。
         for joint in 0..NUM_JOINTS {
@@ -656,9 +795,10 @@ impl RobotIo for Ft1910Io {
         Err(IoError::Bus("Ft1910Io::slow_sensors 尚未实现（时序 #20）".into()))
     }
 
-    // IMU 已收到足够多的有效四元数才算 ready；ft6 的状态位判据（byte13 & 0x07 == 0）在 #19 补。
+    // 就绪在每帧 read() 里按人格更新：ft6 看状态字节 (byte13 & 0x07)==0，native 看解码器
+    // 累计的有效四元数。这里只返回最近一帧的结论。
     fn imu_ready(&self) -> bool {
-        self.decoder.ready()
+        self.imu_ready_flag
     }
 
     fn imu_stale(&self) -> ImuStale {
@@ -824,10 +964,11 @@ mod tests {
     fn read_解析15舵机加imu() {
         // 零位 2048、方向 +1：位置 +100，速度 +10，电流 −20（验证取绝对值）。
         let servo = servo_block(2048 + 100, 10, 0x8000 | 20);
-        // 陀螺全 0；四元数 x=0.125（半精度 0x3000），y=z=0（绕 x 前倾）。
-        // 连续 3 个相同姿态块、序号递增，让官方解码器的重力 3 点中值 settle 到该姿态。
+        // 陀螺全 0；四元数 x≈0.125（半精度 0x3000），y=z=0（绕 x 前倾）。
+        // 序号递增、quat 低位也逐帧微抖（0x3000/1/2）：真芯片静置时低位照样在跳，这样前
+        // 12 字节窗口每帧不同，不会被窗口冻结计数误判；3 点中值 settle 到 0x3001（仍≈0.125）。
         let imu_blocks: Vec<Vec<u8>> = (1u8..=3)
-            .map(|count| imu_block([0, 0, 0], [0x3000, 0, 0], count, 0x00))
+            .map(|c| imu_block([0, 0, 0], [0x3000 + u16::from(c - 1), 0, 0], c, 0x00))
             .collect();
 
         let mut io = backend_with(imu_blocks, &servo, Calibration::default());
@@ -867,9 +1008,9 @@ mod tests {
         assert!(g[0].abs() < 1e-6, "绕 x 前倾时重力 x 分量应为 0");
         assert!(g[1].abs() > 0.1, "中值 settle 后重力 y 应被转出倾斜");
 
-        // 读到 3 帧，序号各不相同：总数 3、连续陈旧为 0。
+        // 3 帧窗口逐帧不同、序号递增：没有任何陈旧读数，total/run 都为 0。
         let stale = io.imu_stale();
-        assert_eq!(stale.total, 3);
+        assert_eq!(stale.total, 0);
         assert_eq!(stale.run, 0);
     }
 
@@ -1189,5 +1330,214 @@ mod tests {
         assert_eq!(addr, reg::GOAL_POSITION_L);
         assert_eq!(entries[0].1, 2148u16.to_le_bytes().to_vec());
         assert_eq!(entries[1].1, 2048u16.to_le_bytes().to_vec());
+    }
+
+    // ── #19 IMU ft6 人格：就绪 / 形状 / 陈旧 / 身份窗 ─────────────────────────
+
+    /// 构造 ft6 后端，准备一个「1 IMU + 15 舵机」读 burst（位置全零位），不预先 read。
+    fn ft6_io_one(status: u8, quat: [u16; 3], reserved: u8, count: u8) -> Ft1910Io {
+        let servo = servo_block(2048, 0, 0);
+        let mut imu = imu_block([0, 0, 0], quat, count, status);
+        imu[imu_block::RESERVED] = reserved;
+        backend_with(vec![imu], &servo, Calibration::default())
+    }
+
+    // ── StaleTracker 计数口径（直接单测，对齐官方 StaleImuTracker）────────────
+
+    /// 造一个只改 quat x（byte6..8）的前 12 字节窗口。
+    fn window(quat_x: u16) -> [u8; IMU_BLOCK_LEN] {
+        let mut w = [0u8; IMU_BLOCK_LEN];
+        w[6..8].copy_from_slice(&quat_x.to_le_bytes());
+        w
+    }
+
+    #[test]
+    fn stale_第一块不计数_后续新鲜保持零() {
+        let mut t = StaleTracker::new();
+        assert_eq!(t.observe(&window(0x3000), 1), (0, 0));
+        assert_eq!(t.snapshot(), ImuStale { total: 0, run: 0 });
+        assert_eq!(t.observe(&window(0x3001), 2), (0, 0));
+        assert_eq!(t.snapshot(), ImuStale { total: 0, run: 0 });
+    }
+
+    #[test]
+    fn stale_窗口重复累计total_新鲜块只把run归零() {
+        let mut t = StaleTracker::new();
+        t.observe(&window(0x3000), 1);
+        // 第二块窗口相同、序号不同：窗口重复 1 次，序号仍为 0。
+        assert_eq!(t.observe(&window(0x3000), 2), (0, 1));
+        assert_eq!(t.snapshot(), ImuStale { total: 1, run: 1 });
+        // 再来一块新窗口：run 归零，total 保留累计（不复位）。
+        assert_eq!(t.observe(&window(0x3005), 3), (0, 0));
+        assert_eq!(t.snapshot(), ImuStale { total: 1, run: 0 });
+    }
+
+    #[test]
+    fn stale_ft6序号连续三次停滞_窗口同步重复() {
+        let mut t = StaleTracker::new();
+        let w = window(0x3000);
+        assert_eq!(t.observe(&w, 5), (0, 0));
+        assert_eq!(t.observe(&w, 5).0, 1);
+        // 第 3 个相同序号：seq_run=2（= FT6_SEQ_STALE_RUN），板端重发时窗口也同步重复。
+        let (seq, win) = t.observe(&w, 5);
+        assert_eq!(seq, FT6_SEQ_STALE_RUN);
+        assert_eq!(win, FT6_SEQ_STALE_RUN);
+    }
+
+    #[test]
+    fn stale_窗口连续重复到冻结阈值() {
+        let mut t = StaleTracker::new();
+        let w = window(0x3000);
+        t.observe(&w, 1); // 基线，不计数
+        // 序号逐帧递增（只测窗口、不触发 seq）；第 26 个相同块即 FROZEN_RUN 次重复到达阈值。
+        for k in 1u64..=FROZEN_RUN {
+            let (seq, win) = t.observe(&w, (k as u8) + 1);
+            assert_eq!(seq, 0, "序号递增，seq_run 恒为 0");
+            assert_eq!(win, k);
+        }
+        assert_eq!(
+            t.snapshot(),
+            ImuStale {
+                total: FROZEN_RUN,
+                run: FROZEN_RUN
+            }
+        );
+    }
+
+    #[test]
+    fn ft6_就绪只看状态位低三位() {
+        let mut io = ft6_io_one(0x00, [0x3000, 0, 0], 0, 1);
+        io.read().ok();
+        assert!(io.imu_ready(), "状态位全 0 且四元数有效应就绪");
+
+        // bit3 READER_SLOW 是「主机读太慢」信息位，不参与就绪。
+        let mut io = ft6_io_one(ft6_status::READER_SLOW, [0x3000, 0, 0], 0, 1);
+        io.read().ok();
+        assert!(io.imu_ready(), "READER_SLOW 不应判未就绪");
+
+        // bit0/1/2 任一置位都不就绪。
+        for status in [
+            ft6_status::NOT_READY,
+            ft6_status::STALE,
+            ft6_status::SENSOR_ERR,
+            0x07,
+        ] {
+            let mut io = ft6_io_one(status, [0x3000, 0, 0], 0, 1);
+            io.read().ok();
+            assert!(!io.imu_ready(), "status=0x{status:02x} 不应就绪");
+        }
+
+        // 状态位全 0 但四元数全 0：板端未出表，仍不就绪。
+        let mut io = ft6_io_one(0x00, [0, 0, 0], 0, 1);
+        io.read().ok();
+        assert!(!io.imu_ready(), "四元数全 0 不应就绪");
+    }
+
+    #[test]
+    fn ft6_形状错误时read报错() {
+        let mut io = ft6_io_one(0x00, [0x3000, 0, 0], 0xAA, 1);
+        assert!(io.read().is_err(), "reserved 非 0 必须拒绝整块");
+        let mut io = ft6_io_one(0x10, [0x3000, 0, 0], 0, 1);
+        assert!(io.read().is_err(), "状态高 4 位非 0 必须拒绝整块");
+    }
+
+    #[test]
+    fn ft6_逐帧新姿态无陈旧_重发同帧才累计() {
+        let servo = servo_block(2048, 0, 0);
+        // 序号递增、quat 低位微抖（真芯片静置低位也跳）：窗口每帧不同，零陈旧。
+        let fresh: Vec<Vec<u8>> = (1u8..=3)
+            .map(|c| imu_block([0, 0, 0], [0x3000 + u16::from(c - 1), 0, 0], c, 0x00))
+            .collect();
+        let mut io = backend_with(fresh, &servo, Calibration::default());
+        for _ in 0..3 {
+            io.read().ok();
+        }
+        assert_eq!(io.imu_stale(), ImuStale { total: 0, run: 0 });
+
+        // 板端重发同一帧（3 个块前 12 字节与序号完全相同）：第 1 块是基线，后 2 块各算一次
+        // 窗口重复，total/run 都是 2（序号停滞的 warn 阈值由下方 tracker 单测锁定）。
+        let stuck: Vec<Vec<u8>> = (0..3)
+            .map(|_| imu_block([0, 0, 0], [0x3000, 0, 0], 5, 0x00))
+            .collect();
+        let mut io = backend_with(stuck, &servo, Calibration::default());
+        for _ in 0..3 {
+            io.read().ok();
+        }
+        assert_eq!(io.imu_stale(), ImuStale { total: 2, run: 2 });
+    }
+
+    #[test]
+    fn native_就绪靠有效四元数计数而非状态位() {
+        let mut cal = Calibration::default();
+        cal.imu_personality = ImuPersonality::Native;
+        let servo = servo_block(2048, 0, 0);
+        // 即使状态位亮着 SFLP_VALID+FUSION_OK，首帧也不就绪（解码器计数不足）。
+        let mut io = backend_with(
+            vec![imu_block([0, 0, 0], [0x3000, 0, 0], 1, 0x81)],
+            &servo,
+            cal,
+        );
+        io.read().ok();
+        assert!(!io.imu_ready(), "native 首帧不应就绪");
+
+        // 累计 25 个有效四元数（序号递增，避免被序号判陈旧）后就绪。
+        let many: Vec<Vec<u8>> = (1u8..=25)
+            .map(|c| imu_block([0, 0, 0], [0x3000, 0, 0], c, 0x81))
+            .collect();
+        let mut io = backend_with(many, &servo, cal);
+        for _ in 0..25 {
+            io.read().ok();
+        }
+        assert!(io.imu_ready(), "native 累计 25 个有效四元数后应就绪");
+    }
+
+    #[test]
+    fn native_传感器错误常亮时不就绪() {
+        let mut cal = Calibration::default();
+        cal.imu_personality = ImuPersonality::Native;
+        let servo = servo_block(2048, 0, 0);
+        // 25 帧有效四元数（低位微抖），但 SENSOR_ERR(0x08) 常亮：即使解码器累计满也不就绪。
+        let many: Vec<Vec<u8>> = (1u8..=25)
+            .map(|c| {
+                imu_block(
+                    [0, 0, 0],
+                    [0x3000 + u16::from(c - 1), 0, 0],
+                    c,
+                    0x81 | native_status::SENSOR_ERR,
+                )
+            })
+            .collect();
+        let mut io = backend_with(many, &servo, cal);
+        for _ in 0..25 {
+            io.read().ok();
+        }
+        assert!(!io.imu_ready(), "native SENSOR_ERR 应和 ft6 一样 gate 就绪");
+    }
+
+    #[test]
+    fn detect_personality_读身份窗识别() {
+        fn io_with_identity(data: &[u8]) -> Ft1910Io {
+            let burst = ack_frame(200, data);
+            Ft1910Io::with_transport(
+                Box::new(ScriptedTransport::new(vec![burst])),
+                "synthetic".to_owned(),
+                Calibration::default(),
+            )
+            .expect("标定合法")
+        }
+        assert_eq!(
+            io_with_identity(&imu_identity::FT6).detect_personality().unwrap(),
+            ImuPersonality::Ft6
+        );
+        assert_eq!(
+            io_with_identity(&imu_identity::NATIVE)
+                .detect_personality()
+                .unwrap(),
+            ImuPersonality::Native
+        );
+        assert!(
+            io_with_identity(&[0xAA; 5]).detect_personality().is_err(),
+            "身份窗无法识别应报错且不改变人格"
+        );
     }
 }
