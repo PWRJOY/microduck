@@ -1170,6 +1170,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "duck_ft1910"
+version = "0.17.4"
+
+[[package]]
 name = "duckctl"
 version = "0.17.4"
 dependencies = [
