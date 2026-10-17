@@ -386,6 +386,32 @@ impl Ft1910Io {
         })
     }
 
+    /// 官方 `DynamixelIo::interpolate_to` 的飞特等价实现：从当前实际位置线性插值到
+    /// `target`，分 `step` 步、每步阻塞写入。只被 `robotd init` 调用（开扭矩后、回 home
+    /// 姿势前）；控制环从不调用它。
+    pub fn interpolate_to(
+        &mut self,
+        target: &[f64; NUM_JOINTS],
+        duration: Duration,
+        step: Duration,
+    ) -> Result<()> {
+        let start = self.read()?.positions;
+        let steps = (duration.as_secs_f64() / step.as_secs_f64())
+            .ceil()
+            .max(1.0) as u32;
+        for i in 1..=steps {
+            let t = i as f64 / steps as f64;
+            let mut next = [0.0; NUM_JOINTS];
+            for j in 0..NUM_JOINTS {
+                next[j] = start[j] + (target[j] - start[j]) * t;
+            }
+            self.write(&JointTargets::new(next))?;
+            std::thread::sleep(step);
+        }
+        Ok(())
+    }
+
+
     /// 把串口错误包成带端口路径的 [`IoError::Port`]。
     fn io_err(&self, source: std::io::Error) -> IoError {
         IoError::Port {
