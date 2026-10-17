@@ -1,0 +1,117 @@
+# 飞特 HD-1910 后端标定（FeeTech backend calibration）
+#
+# 部署位置：/etc/robot/ft1910.toml（与 robotd.toml 同目录）；
+# 也可用环境变量 FT1910_CONFIG 指定其它路径。
+#
+# joints 数组的顺序固定为 duck_control::model::JOINT_NAMES（共 15 个，不能缺漏、不能重排）：
+#   idx 0  left_hip_yaw    (舵机 id 20)
+#   idx 1  left_hip_roll   (id 21)
+#   idx 2  left_hip_pitch  (id 22)
+#   idx 3  left_knee       (id 23)
+#   idx 4  left_ankle      (id 24)
+#   idx 5  neck_pitch      (id 30)
+#   idx 6  head_pitch      (id 31)
+#   idx 7  head_yaw        (id 32)
+#   idx 8  head_roll       (id 33)
+#   idx 9  mouth           (id 34)
+#   idx 10 right_hip_yaw   (id 10)
+#   idx 11 right_hip_roll  (id 11)
+#   idx 12 right_hip_pitch (id 12)
+#   idx 13 right_knee      (id 13)
+#   idx 14 right_ankle     (id 14)
+
+# IMU 小板在总线上伪装成的舵机 id（十进制 200）
+imu_id = 200
+# 总线波特率：HD-1910 与 IMU 板统一 1M
+baud_rate = 1000000
+# IMU 固件人格：社区板刷 ft6 v1.6.0 写 "Ft6"；老 native v1.4.x 写 "Native"
+imu_personality = "Ft6"
+# IMU 安装四元数 [w, x, y, z]：ft6 固件已在板端做安装预旋转（X/Y 反向），主机端用单位四元数
+imu_mount = [1.0, 0.0, 0.0, 0.0]
+
+[pd]
+# 策略标称增益 200 对应写入飞特 RAM 寄存器 50(P)/51(D) 的档位（掉电不保留，重启后由软件重写）
+kp = 6
+kd = 20
+# 嘴机构比腿轻，单独给更大的 P
+mouth_kp = 10
+
+# 每个关节：
+#   zero_ticks 机械零位原始计数（舵机已用 0x0B CAL 把零位烧进内部 EEPROM，恒为 2048）
+#   direction  装配方向：正装 +1 / 反装 −1（2026-09-20 实测，仅 30/31 号颈部/头部俯仰为 +1）
+#   limits     软件行程限位（原始计数，写目标时裁剪）
+
+[[joints]] # 0  left_hip_yaw    (id 20)
+zero_ticks = 2048
+direction = -1
+limits = [0, 4095]
+
+[[joints]] # 1  left_hip_roll   (id 21)
+zero_ticks = 2048
+direction = -1
+limits = [0, 4095]
+
+[[joints]] # 2  left_hip_pitch  (id 22)
+zero_ticks = 2048
+direction = -1
+limits = [0, 4095]
+
+[[joints]] # 3  left_knee       (id 23)
+zero_ticks = 2048
+direction = -1
+limits = [0, 4095]
+
+[[joints]] # 4  left_ankle      (id 24)
+zero_ticks = 2048
+direction = -1
+limits = [0, 4095]
+
+[[joints]] # 5  neck_pitch      (id 30)
+zero_ticks = 2048
+direction = 1
+limits = [0, 4095]
+
+[[joints]] # 6  head_pitch      (id 31)
+zero_ticks = 2048
+direction = 1
+limits = [0, 4095]
+
+[[joints]] # 7  head_yaw        (id 32)
+zero_ticks = 2048
+direction = -1
+limits = [0, 4095]
+
+[[joints]] # 8  head_roll       (id 33)
+zero_ticks = 2048
+direction = -1
+limits = [0, 4095]
+
+[[joints]] # 9  mouth           (id 34)
+zero_ticks = 2048
+direction = -1
+limits = [0, 4095]
+
+[[joints]] # 10 right_hip_yaw   (id 10)
+zero_ticks = 2048
+direction = -1
+limits = [0, 4095]
+
+[[joints]] # 11 right_hip_roll  (id 11)
+zero_ticks = 2048
+direction = -1
+limits = [0, 4095]
+
+[[joints]] # 12 right_hip_pitch (id 12)
+zero_ticks = 2048
+direction = -1
+limits = [0, 4095]
+
+[[joints]] # 13 right_knee      (id 13)
+zero_ticks = 2048
+direction = -1
+limits = [0, 4095]
+
+[[joints]] # 14 right_ankle     (id 14)
+zero_ticks = 2048
+direction = -1
+limits = [0, 4095]

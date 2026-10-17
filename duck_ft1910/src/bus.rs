@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 use duck_control::imu::{SflpDecoder, IMU_BLOCK_LEN};
 use duck_control::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
 use duck_control::model::{JOINT_IDS, JOINT_NAMES, MOUTH_INDEX, NUM_JOINTS};
+use serde::{Deserialize, Serialize};
 
 use crate::wire::{
     self, block, ft6_status, gains_block, imu_block, imu_identity, native_status, reg,
@@ -61,7 +62,8 @@ const BURST_LIMIT: Duration = Duration::from_millis(12);
 /// 主机端 `zero_ticks` 恒为 2048，不需要再为每颗舵机维护一张偏移表；主机只剩一个
 /// 装配方向 `direction`（个别关节反装时为 −1）。字段仍保留，重装或某颗舵机偏移丢失时
 /// 可在配置里覆盖。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct JointCalibration {
     /// 机械零位对应的原始计数（我们内部 CAL 后恒为 2048）。
     pub zero_ticks: i32,
@@ -86,7 +88,8 @@ impl Default for JointCalibration {
 /// 控制环传下来的 `gain` 是 XL330 的单位（200 标称、50 软），不能原样发给飞特：直接
 /// 按该值写 P 会比出厂增益大约 20 倍。这里保留一组飞特自己的基准 P，再把策略增益按
 /// 比例缩放到它附近，保留「增益越大越硬、软倒时确实软」的含义，但不假装两族舵机共用单位。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PdProfile {
     /// 普通关节在策略标称增益（200）下的 P（飞特单位）。
     pub kp: u8,
@@ -125,10 +128,10 @@ impl PdProfile {
 ///
 /// 我们的社区 IMU 板刷的是 ft6 v1.6.0 固件，默认 [`ImuPersonality::Ft6`]；
 /// 人格也可由 [`Ft1910Io::detect_personality`] 读 ID 200 身份窗自动识别。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ImuPersonality {
     /// 飞特 ft6 人格（v1.6.0 起默认）：就绪 = (byte13 & 0x07)==0；12 个控制字节已在板端
-    /// 做安装预旋转，主机 mount 用单位四元数。
+    /// 做安装预旋转，主机 mount 用单位四元数。配置文件里写 `imu_personality = "Ft6"`。
     #[default]
     Ft6,
     /// community-kit native 人格（v1.4.x 契约）：byte13 的 0x01/0x80 是好事，就绪靠
@@ -137,7 +140,8 @@ pub enum ImuPersonality {
 }
 
 /// 整机标定：IMU 地址/人格、15 个关节的零位/方向、增益档位、IMU 安装朝向、波特率。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Calibration {
     /// IMU 在总线上的舵机 id（伪装成舵机）。
     pub imu_id: u8,
@@ -188,6 +192,30 @@ impl Calibration {
             }
         }
         Ok(())
+    }
+
+    /// 板子上飞特标定文件的默认位置，与 robotd.toml 同目录（/etc/robot）。
+    pub const CONFIG_PATH: &str = "/etc/robot/ft1910.toml";
+
+    /// 从 TOML 文件读取并校验一张标定。文件缺失、解析失败或数值越界都返回错误说明。
+    pub fn from_file(path: &str) -> std::result::Result<Self, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("读取飞特标定文件 {path} 失败: {e}"))?;
+        let cal: Calibration = toml::from_str(&text)
+            .map_err(|e| format!("解析飞特标定文件 {path} 失败: {e}"))?;
+        cal.validate()?;
+        Ok(cal)
+    }
+
+    /// 启动加载：优先环境变量 `FT1910_CONFIG`，否则用 [`Self::CONFIG_PATH`]。
+    ///
+    /// 读不到或不合法都返回错误，**不静默回退到默认方向**——默认标定方向全是 +1，而本机
+    /// 实测 13 个关节为 −1，静默回退会让腿往反方向动。调用方（robotd 的 open_bus）把它当作
+    /// 总线未就绪、继续重试等待，和舵机没上电走同一条路径。
+    pub fn load_for_boot() -> std::result::Result<Self, String> {
+        let path =
+            std::env::var("FT1910_CONFIG").unwrap_or_else(|_| Self::CONFIG_PATH.to_owned());
+        Self::from_file(&path)
     }
 }
 
@@ -1633,5 +1661,42 @@ mod tests {
             io_with_identity(&[0xAA; 5]).detect_personality().is_err(),
             "身份窗无法识别应报错且不改变人格"
         );
+    }
+
+    /// 仓库随附的标定模板 config/ft1910.toml 必须能解析、通过校验，且与本机实测一致。
+    /// 用 include_str! 把模板编译进测试：模板漏关节、方向写错或越界，这里立刻挂。
+    #[test]
+    fn 标定模板_ft1910_toml_解析且匹配实测() {
+        const TEXT: &str = include_str!("../config/ft1910.toml");
+        let cal: Calibration = toml::from_str(TEXT).expect("标定模板必须能解析");
+        cal.validate().expect("标定模板必须通过校验");
+
+        assert_eq!(cal.imu_id, 200);
+        assert_eq!(cal.baud_rate, 1_000_000);
+        assert_eq!(cal.imu_personality, ImuPersonality::Ft6);
+        assert_eq!(cal.imu_mount, [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(cal.pd, PdProfile { kp: 6, kd: 20, mouth_kp: 10 });
+
+        // 15 个关节零位/限位一致；方向仅 neck_pitch(id30)、head_pitch(id31) 为 +1，其余 −1。
+        assert_eq!(cal.joints.len(), 15);
+        for (i, joint) in cal.joints.iter().enumerate() {
+            assert_eq!(joint.zero_ticks, 2048, "joint {i} zero_ticks");
+            assert_eq!(joint.limits, (0, 4095), "joint {i} limits");
+            let expect_dir = if matches!(JOINT_NAMES[i], "neck_pitch" | "head_pitch") {
+                1.0
+            } else {
+                -1.0
+            };
+            assert_eq!(joint.direction, expect_dir, "joint {} direction", JOINT_NAMES[i]);
+        }
+    }
+
+    /// 序列化再反序列化应得到同一张标定（TOML round-trip）。
+    #[test]
+    fn 标定_toml_往返一致() {
+        let cal = Calibration::default();
+        let text = toml::to_string(&cal).expect("序列化");
+        let back: Calibration = toml::from_str(&text).expect("反序列化");
+        assert_eq!(cal, back);
     }
 }

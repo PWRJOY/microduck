@@ -1353,9 +1353,15 @@ impl Drop for WaitingVoice {
 }
 
 /// The real bus on the board; a fake elsewhere, so `open_bus_waiting` has one signature.
-#[cfg(target_os = "linux")]
+///
+/// 三选一：显式开 `ft1910` feature 时用飞特 HD-1910 后端（不限平台，这样开发机上也能
+/// `cargo check --features ft1910` 提前验证接线）；否则 linux 用官方 Dynamixel，其它平台 FakeIo。
+/// 下游控制环全是 `fn control_loop<T: RobotIo>` 泛型，切换这里的具体类型即整体切换后端。
+#[cfg(feature = "ft1910")]
+type BusIo = duck_ft1910::Ft1910Io;
+#[cfg(all(target_os = "linux", not(feature = "ft1910")))]
 type BusIo = duck_control::bus::DynamixelIo;
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), not(feature = "ft1910")))]
 type BusIo = FakeIo;
 
 /// Open and verify the bus, waiting for a robot to answer.
@@ -1416,6 +1422,7 @@ async fn open_bus_waiting(bus: &params::Bus, state: &RobotState) -> Option<BusIo
 /// Open and verify the bus, or explain why not.
 /// The body IMU's sensor→trunk mount on `board`: the power board stands on edge in a `zero3`
 /// and lies flat in a `beta`.
+#[cfg(all(target_os = "linux", not(feature = "ft1910")))]
 fn body_imu_mount(board: robotd_params::board::Board) -> [f64; 4] {
     use duck_control::imu::SflpDecoder;
     match board {
@@ -1424,7 +1431,7 @@ fn body_imu_mount(board: robotd_params::board::Board) -> [f64; 4] {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "ft1910")))]
 fn open_bus(
     bus: &params::Bus,
     board: robotd_params::board::Board,
@@ -1474,6 +1481,67 @@ fn open_bus(
     Some(io)
 }
 
+/// FeeTech HD-1910 版的 open_bus（`ft1910` feature）。
+///
+/// 与 Dynamixel 版的差别：飞特舵机的 id/波特率出厂固定、零位已用 0x0B CAL 烧进 EEPROM，
+/// 没有 factory-defaults 那一套，所以不需要 adopt_missing_servo / check_registers；IMU 的
+/// 安装旋转已在标定里（ft6 板端预旋转），也不需要 set_imu_mount。标定由 duck_ft1910 自己
+/// 从 /etc/robot/ft1910.toml 读取（可用 FT1910_CONFIG 覆盖），robotd-params 一字不改。
+#[cfg(feature = "ft1910")]
+fn open_bus(
+    bus: &params::Bus,
+    _board: robotd_params::board::Board,
+    attempt: u32,
+    missing: &mut Vec<u8>,
+    _adopted: &mut Option<u8>,
+) -> Option<BusIo> {
+    let loud = attempt == 0 || attempt.is_multiple_of(STARTUP_READ_LOG_EVERY);
+    let port = bus.port.as_str();
+
+    let calibration = match duck_ft1910::Calibration::load_for_boot() {
+        Ok(cal) => cal,
+        Err(e) => {
+            if loud {
+                tracing::error!(error = %e, port, attempt, "cannot load the FeeTech calibration; waiting");
+            }
+            return None;
+        }
+    };
+
+    let mut io = match duck_ft1910::Ft1910Io::open(port, calibration) {
+        Ok(io) => io,
+        Err(e) => {
+            if loud {
+                tracing::error!(error = %e, port, attempt, "cannot open the bus; waiting");
+            }
+            return None;
+        }
+    };
+
+    // 一次 read 同时验证 15 舵机 + IMU：飞特 read 是 all-or-nothing，任一设备不应答就 Err，
+    // 一个事务替代了 Dynamixel 版的舵机 census + IMU ping。具体缺哪颗暂不上报，先通用等待。
+    match io.read() {
+        Ok(_) => {
+            missing.clear();
+            if loud {
+                tracing::info!("FeeTech bus up: 15 servos + IMU answered");
+            }
+            Some(io)
+        }
+        Err(e) => {
+            if loud {
+                tracing::error!(
+                    error = %e,
+                    port,
+                    attempt,
+                    "bus not answering; waiting, is servo power on?"
+                );
+            }
+            None
+        }
+    }
+}
+
 /// Does the IMU board answer, now that every servo has?
 ///
 /// Outside [`open_bus`] because `init` shares that and has no use for orientation: ramping to
@@ -1482,7 +1550,7 @@ fn open_bus(
 /// specific to go on, blames the whole bus.
 ///
 /// `None` when the ping could not be made at all, which says nothing about the board.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "ft1910")))]
 fn imu_answers(io: &mut BusIo, attempt: u32) -> Option<bool> {
     let loud = attempt == 0 || attempt.is_multiple_of(STARTUP_READ_LOG_EVERY);
     let id = duck_control::model::IMU_DXL_ID;
@@ -1507,7 +1575,9 @@ fn imu_answers(io: &mut BusIo, attempt: u32) -> Option<bool> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+// 飞特版：open_bus 已经用一次 read 确认了 IMU 板应答（read 是 all-or-nothing，IMU 缺失即
+// Err），这里无需再 ping。非 linux 的 FakeIo 同样无需 ping。
+#[cfg(any(feature = "ft1910", not(target_os = "linux")))]
 fn imu_answers(_io: &mut BusIo, _attempt: u32) -> Option<bool> {
     Some(true)
 }
@@ -1522,7 +1592,7 @@ fn imu_answers(_io: &mut BusIo, _attempt: u32) -> Option<bool> {
 /// Returns whether the bus is worth checking further. `false` is "keep waiting": every servo
 /// unpowered, a servo missing with nothing fresh to replace it, or two missing at once, which
 /// cannot be told apart and is left to a human.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "ft1910")))]
 fn adopt_missing_servo(
     io: &mut BusIo,
     loud: bool,
@@ -1584,7 +1654,7 @@ fn adopt_missing_servo(
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), not(feature = "ft1910")))]
 fn open_bus(
     _bus: &params::Bus,
     _board: robotd_params::board::Board,

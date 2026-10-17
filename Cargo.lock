@@ -1174,7 +1174,9 @@ name = "duck_ft1910"
 version = "0.17.4"
 dependencies = [
  "duck-control",
+ "serde",
  "serialport",
+ "toml 0.9.12+spec-1.1.0",
  "tracing",
 ]
 
@@ -3896,6 +3898,7 @@ dependencies = [
  "clap",
  "duck-control",
  "duck-ipc-proto",
+ "duck_ft1910",
  "kinematics",
  "libc",
  "minisign",

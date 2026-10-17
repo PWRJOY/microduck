@@ -6,9 +6,11 @@
 //! 模块划分：
 //! - [`wire`]：帧编解码、寄存器地址、单位换算。只处理字节，不碰串口、不依赖硬件，因此全部
 //!   编解码都能在开发机离线单测，且与我们实测跑通的 servo-web Python 实现逐字节对齐。
-//! - [`bus`]：[`bus::Ft1910Io`]，实现 `RobotIo`，负责一次 SYNC_READ 读回 15 舵机 + IMU。
-//! - （后续）`imu`：200 号 IMU 板的 ft6 状态判据与挂载复核（#19，当前先复用官方解码器）。
-//! - （后续）`config`：关节映射、零位标定、PD 与 IMU 配置文件（#21）。
+//! - [`bus`]：[`bus::Ft1910Io`]，实现 `RobotIo`，一次 SYNC_READ 读回 15 舵机 + IMU，并内含
+//!   200 号 IMU 板的 ft6/native 就绪判据（#19）。
+//! - 标定：[`bus::Calibration`] 从 TOML 读取（启动默认 `/etc/robot/ft1910.toml`，可用环境变量
+//!   `FT1910_CONFIG` 覆盖；随仓库模板见 `config/ft1910.toml`），含关节方向/零位、PD、IMU
+//!   人格与安装朝向。robotd 开 `ft1910` feature 即选用本后端。
 
 pub mod bus;
 pub mod wire;

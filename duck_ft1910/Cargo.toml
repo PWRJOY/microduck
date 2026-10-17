@@ -13,4 +13,8 @@ duck-control = { path = "../duck-control" }
 # 与 duck-control / rustypot 保持同一大版本，且必须 default-features = false：
 # 去掉只用于枚举端口的 libudev feature，否则 aarch64 板子上原生编译会因缺 sysroot 失败。
 serialport = { version = "4.8", default-features = false }
+# 飞特标定文件（关节方向/零位/PD/IMU 人格）由本 crate 自己读取，不改 robotd-params。
+# 格式与 robotd.toml 同为 TOML（toml 版本也对齐 robotd）。
+serde = { workspace = true, features = ["derive"] }
+toml = "0.9"
 tracing.workspace = true

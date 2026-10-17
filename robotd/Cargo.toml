@@ -5,9 +5,18 @@ edition.workspace = true
 license.workspace = true
 description = "Robot control daemon — skeleton"
 
+[features]
+# 用飞特 HD-1910 总线后端替换官方 Dynamixel 后端：main.rs 的 BusIo / open_bus 按此 feature
+# 二选一。开启后只增加一个后端，不改官方任何控制逻辑；不开启时官方构建一字不变。
+# 交叉编译：cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.31 -p robotd --features ft1910
+ft1910 = ["dep:duck_ft1910"]
+
 [dependencies]
 duck-ipc-proto = { path = "../duck-ipc-proto" }
 duck-control = { path = "../duck-control" }
+# FeeTech HD-1910 后端，默认不编译（官方默认仍是 Dynamixel）。仅在 --features ft1910
+# 时接入，main.rs 里用 cfg 在两套后端之间选择；本依赖 optional，不影响官方构建。
+duck_ft1910 = { path = "../duck_ft1910", optional = true }
 robotd-params = { path = "../robotd-params" }
 kinematics = { path = "../kinematics" }
 odometry = { path = "../odometry" }
