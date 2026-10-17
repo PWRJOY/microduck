@@ -17,7 +17,14 @@
 //! EEPROM 重载，从不写 EEPROM）。扭矩开关（寄存器 40）**必须逐颗 WRITE 并等应答**——
 //! 实测 SYNC_WRITE 写 40 不生效。上使能严格按「读当前姿态 → 写增益并校验 → 把目标贴成
 //! 当前位置并校验 → 逐颗上扭矩 → 读回」的顺序，让吸合瞬间每颗舵机的误差为 0，避免
-//! 15 颗同时冲向旧目标、电流涌入触发板子欠压复位。慢变量（电压/温度）留给 #20。
+//! 15 颗同时冲向旧目标、电流涌入触发板子欠压复位。
+//!
+//! 50Hz 时序预算（1M 波特，10µs/字节，20ms 一 tick）：每 tick 一次 SYNC_READ（16 设备 ×
+//! 15 字节，约 3.6ms）+ 一次广播 SYNC_WRITE（约 0.53ms）≈ 4.1ms，占周期约 21%。增益不变时
+//! set_gain 一个字节都不发；增益切换那一 tick 额外写+读回约 3.2ms，仍 < 20ms。缺设备时
+//! burst 收齐其余应答后按 BURST_IDLE(4ms) 收摊、整总线全断才吃满 BURST_LIMIT(12ms)，都不会
+//! 顶破一个 tick。慢传感器（电压/温度）的飞特地址 62/63 已落在每 tick 的状态块内，
+//! slow_sensors() 直接复用 read 缓存、零额外总线（不像 Dynamixel 要每秒补一次读）。
 
 use std::array;
 use std::time::{Duration, Instant};
@@ -301,6 +308,9 @@ pub struct Ft1910Io {
     gains_verified: bool,
     /// 15 颗舵机是否已全部确认使能扭矩。松脱时 [`RobotIo::write`] 不发目标。
     enabled: bool,
+    /// 最近一次成功 read() 顺带解析出的电压/温度。飞特寄存器 62(电压)/63(温度) 落在每 tick
+    /// 已读的 15 字节状态块（地址 56..70）里，所以慢传感器不额外发总线帧。首次成功 read 前为 None。
+    last_slow: Option<SlowSensors>,
     io_timeout: Duration,
 }
 
@@ -343,6 +353,7 @@ impl Ft1910Io {
             gain: 0,
             gains_verified: false,
             enabled: false,
+            last_slow: None,
             io_timeout: BURST_LIMIT,
         })
     }
@@ -670,7 +681,11 @@ impl RobotIo for Ft1910Io {
             );
         }
 
-        // 其余 15 块按关节表顺序填充。
+        // 其余 15 块按关节表顺序填充。read() 是 all-or-nothing：走到这里 15 块都齐，电压/
+        // 温度也一并缓存，供每秒一次的 slow_sensors() 复用，不再单独发总线帧。
+        let mut temps_c = [0.0f64; NUM_JOINTS];
+        let mut volts_sum = 0.0f64;
+        let mut volts_n = 0u32;
         for joint in 0..NUM_JOINTS {
             let blk = &blocks[joint + 1];
             if blk.len() < block::LEN {
@@ -691,6 +706,22 @@ impl RobotIo for Ft1910Io {
             // 电流取无符号绝对值，负载是正还是负对热和限流没有意义。
             sensors.currents_ma[joint] =
                 wire::sign15(current).unsigned_abs() as f64 * wire::MA_PER_CURRENT_COUNT;
+
+            // 电压(寄存器 62、块内偏移 6) 单位 0.1V；温度(寄存器 63、偏移 7) 直接是 ℃、无偏移。
+            // 15 颗在同一电池上，电压平均降噪；读数 0 是上电瞬间的无意义值，丢弃不平均。
+            let volt_raw = blk[block::VOLTAGE];
+            if volt_raw != 0 {
+                volts_sum += f64::from(volt_raw) * wire::VOLTS_PER_COUNT;
+                volts_n += 1;
+            }
+            temps_c[joint] = f64::from(blk[block::TEMPERATURE]);
+        }
+        // 至少一颗读到非零电压才刷新慢传感器样本；全 0（上电瞬间）时保留上一帧。
+        if volts_n > 0 {
+            self.last_slow = Some(SlowSensors {
+                volts: volts_sum / f64::from(volts_n),
+                temps_c,
+            });
         }
 
         Ok(sensors)
@@ -790,9 +821,13 @@ impl RobotIo for Ft1910Io {
         Ok(())
     }
 
-    // 慢变量（电压/温度/增益漂移巡检）在 #20 落地。
+    /// 电压/温度复用每 tick 状态块（地址 62/63 在 56..70 内），**不额外占用总线**。
+    /// 控制环每秒调一次；尚未成功 read 过时返回 Err，调用方保留上一个样本（与官方后端
+    /// 一次偶发读失败时保留上次采样的处理一致）。
     fn slow_sensors(&mut self) -> Result<SlowSensors> {
-        Err(IoError::Bus("Ft1910Io::slow_sensors 尚未实现（时序 #20）".into()))
+        self.last_slow.ok_or_else(|| {
+            IoError::Bus("尚无成功的总线 read，慢传感器（电压/温度）暂无数据".into())
+        })
     }
 
     // 就绪在每帧 read() 里按人格更新：ft6 看状态字节 (byte13 & 0x07)==0，native 看解码器
@@ -1051,6 +1086,65 @@ mod tests {
 
         let err = io.read().expect_err("缺设备应报错");
         assert!(matches!(err, IoError::Bus(msg) if msg.contains("没有响应的设备")));
+    }
+
+    #[test]
+    fn slow_sensors_首次read前无数据_成功后复用状态块() {
+        // 15 颗电压都读 120（=12.0V）、温度 35℃。
+        let mut servo = servo_block(2048, 0, 0);
+        servo[block::VOLTAGE] = 120;
+        servo[block::TEMPERATURE] = 35;
+        let imu_blocks = vec![imu_block([0, 0, 0], [0x3000, 0, 0], 1, 0x00)];
+
+        let mut io = backend_with(imu_blocks, &servo, Calibration::default());
+        assert!(io.slow_sensors().is_err(), "尚未 read 时应无慢传感器样本");
+
+        io.read().expect("read 应成功");
+        let slow = io.slow_sensors().expect("read 后应能取到慢传感器");
+        assert!((slow.volts - 12.0).abs() < 1e-9, "电压 120×0.1 应 = 12.0V");
+        for joint in 0..NUM_JOINTS {
+            assert!(
+                (slow.temps_c[joint] - 35.0).abs() < 1e-9,
+                "关节 {joint} 温度应为 35℃"
+            );
+        }
+    }
+
+    #[test]
+    fn slow_sensors_全零电压帧不产生也不覆盖样本() {
+        // 第一帧电压 120（正常），第二帧 15 颗电压全 0（上电瞬间的无意义读数）。
+        let mut good = servo_block(2048, 0, 0);
+        good[block::VOLTAGE] = 120;
+        good[block::TEMPERATURE] = 35;
+        let dead = servo_block(2048, 0, 0); // 电压/温度字节默认 0
+        let mk_burst = |servo: &[u8], count: u8| {
+            // 四元数随帧微抖，保证前 12 字节窗口逐帧不同。
+            let mut burst = ack_frame(
+                200,
+                &imu_block([0, 0, 0], [0x3000 + u16::from(count), 0, 0], count, 0x00),
+            );
+            for id in JOINT_IDS.iter() {
+                burst.extend(ack_frame(*id, servo));
+            }
+            burst
+        };
+        let bursts = vec![mk_burst(&good, 1), mk_burst(&dead, 2)];
+
+        let mut io = Ft1910Io::with_transport(
+            Box::new(ScriptedTransport::new(bursts)),
+            "synthetic".to_owned(),
+            Calibration::default(),
+        )
+        .expect("标定合法");
+
+        io.read().expect("第一帧正常");
+        io.read().expect("第二帧全 0 电压");
+        let slow = io.slow_sensors().expect("全 0 帧应保留上一帧样本，而非清空");
+        assert!((slow.volts - 12.0).abs() < 1e-9, "全 0 帧不应覆盖已有电压");
+        assert!(
+            (slow.temps_c[0] - 35.0).abs() < 1e-9,
+            "全 0 帧不应覆盖已有温度"
+        );
     }
 
     #[test]
