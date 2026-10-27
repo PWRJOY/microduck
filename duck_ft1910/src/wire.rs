@@ -545,6 +545,9 @@ pub const MA_PER_CURRENT_COUNT: f64 = 6.5;
 /// 电压寄存器每计数对应伏特。
 pub const VOLTS_PER_COUNT: f64 = 0.1;
 
+/// 负载寄存器每计数对应百分比（手册：负载 /10 = 百分比，−1000..1000 → −100%..100%）。
+pub const LOAD_PERCENT_PER_COUNT: f64 = 0.1;
+
 pub fn le_u16(low: u8, high: u8) -> u16 {
     u16::from_le_bytes([low, high])
 }

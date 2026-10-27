@@ -339,6 +339,9 @@ pub struct Ft1910Io {
     /// 最近一次成功 read() 顺带解析出的电压/温度。飞特寄存器 62(电压)/63(温度) 落在每 tick
     /// 已读的 15 字节状态块（地址 56..70）里，所以慢传感器不额外发总线帧。首次成功 read 前为 None。
     last_slow: Option<SlowSensors>,
+    /// 扩展数据共享缓存（逐颗电压/温度/负载）：read() 每帧写入，ext::spawn_writer 后台线程
+    /// 原子落盘到 /run/microduck_ext.json，主机侧 bridge 走 SSH 拉取。官方接口零改动。
+    ext: crate::ext::ExtShared,
     io_timeout: Duration,
 }
 
@@ -355,7 +358,9 @@ impl Ft1910Io {
                 path: path.to_owned(),
                 source: source.into(),
             })?;
-        Self::with_transport(Box::new(SerialTransport { port }), path.to_owned(), calibration)
+        let io = Self::with_transport(Box::new(SerialTransport { port }), path.to_owned(), calibration)?;
+        io.spawn_ext_writer();
+        Ok(io)
     }
 
     /// 用任意传输层构造（主要给离线测试注入假传输层）。
@@ -382,8 +387,19 @@ impl Ft1910Io {
             gains_verified: false,
             enabled: false,
             last_slow: None,
+            ext: std::sync::Arc::new(std::sync::Mutex::new(crate::ext::ExtSample::default())),
             io_timeout: BURST_LIMIT,
         })
+    }
+
+    /// 启动扩展数据落盘线程（仅真实串口路径 `open` 调用；`with_transport` 供离线测试注入
+    /// 假传输，不落盘）。线程 daemon 化随 robotd 进程生命周期，重启即随新进程重起。
+    pub fn spawn_ext_writer(&self) {
+        crate::ext::spawn_writer(
+            self.ext.clone(),
+            std::time::Duration::from_millis(100),
+            crate::ext::default_path(),
+        );
     }
 
     /// 官方 `DynamixelIo::interpolate_to` 的飞特等价实现：从当前实际位置线性插值到
@@ -736,8 +752,11 @@ impl RobotIo for Ft1910Io {
         }
 
         // 其余 15 块按关节表顺序填充。read() 是 all-or-nothing：走到这里 15 块都齐，电压/
-        // 温度也一并缓存，供每秒一次的 slow_sensors() 复用，不再单独发总线帧。
+        // 温度/负载也一并缓存，供每秒一次的 slow_sensors() 与扩展通道（ext.rs）复用，
+        // 不再单独发总线帧。
         let mut temps_c = [0.0f64; NUM_JOINTS];
+        let mut volts = [0.0f64; NUM_JOINTS];
+        let mut loads = [0.0f64; NUM_JOINTS];
         let mut volts_sum = 0.0f64;
         let mut volts_n = 0u32;
         for joint in 0..NUM_JOINTS {
@@ -762,20 +781,36 @@ impl RobotIo for Ft1910Io {
                 wire::sign15(current).unsigned_abs() as f64 * wire::MA_PER_CURRENT_COUNT;
 
             // 电压(寄存器 62、块内偏移 6) 单位 0.1V；温度(寄存器 63、偏移 7) 直接是 ℃、无偏移。
+            // 负载(寄存器 60、偏移 4) 带符号 ÷10 = %（正=堵转方向，负=反向）。
             // 15 颗在同一电池上，电压平均降噪；读数 0 是上电瞬间的无意义值，丢弃不平均。
+            loads[joint] =
+                wire::sign15(wire::le_u16(blk[block::LOAD], blk[block::LOAD + 1])) as f64
+                    * wire::LOAD_PERCENT_PER_COUNT;
             let volt_raw = blk[block::VOLTAGE];
             if volt_raw != 0 {
-                volts_sum += f64::from(volt_raw) * wire::VOLTS_PER_COUNT;
+                volts[joint] = f64::from(volt_raw) * wire::VOLTS_PER_COUNT;
+                volts_sum += volts[joint];
                 volts_n += 1;
             }
             temps_c[joint] = f64::from(blk[block::TEMPERATURE]);
         }
-        // 至少一颗读到非零电压才刷新慢传感器样本；全 0（上电瞬间）时保留上一帧。
+        // 至少一颗读到非零电压才刷新慢传感器样本与扩展样本；全 0（上电瞬间）时保留上一帧。
         if volts_n > 0 {
             self.last_slow = Some(SlowSensors {
                 volts: volts_sum / f64::from(volts_n),
                 temps_c,
             });
+            if let Ok(mut ext) = self.ext.lock() {
+                *ext = crate::ext::ExtSample {
+                    ts: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs_f64())
+                        .unwrap_or(0.0),
+                    volts,
+                    temps_c,
+                    loads,
+                };
+            }
         }
 
         Ok(sensors)
@@ -1700,7 +1735,8 @@ mod tests {
         assert_eq!(cal.imu_id, 200);
         assert_eq!(cal.baud_rate, 1_000_000);
         assert_eq!(cal.imu_personality, ImuPersonality::Ft6);
-        assert_eq!(cal.imu_mount, [1.0, 0.0, 0.0, 0.0]);
+        // 三姿态实测校准后的朝向（绕 y 轴 90°）：随 d71b4c2 calibrate imu_mount 更新。
+        assert_eq!(cal.imu_mount, [0.0, 0.7071067811865476, 0.0, 0.7071067811865476]);
         assert_eq!(cal.pd, PdProfile { kp: 6, kd: 20, mouth_kp: 10 });
 
         // 15 个关节零位/限位一致；方向仅 neck_pitch(id30)、head_pitch(id31) 为 +1，其余 −1。

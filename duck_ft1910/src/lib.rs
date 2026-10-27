@@ -8,11 +8,15 @@
 //!   编解码都能在开发机离线单测，且与我们实测跑通的 servo-web Python 实现逐字节对齐。
 //! - [`bus`]：[`bus::Ft1910Io`]，实现 `RobotIo`，一次 SYNC_READ 读回 15 舵机 + IMU，并内含
 //!   200 号 IMU 板的 ft6/native 就绪判据（#19）。
+//! - [`ext`]：扩展数据通道。逐颗电压/温度/负载是官方接口层没有的字段，由本 crate 内闭环
+//!   补齐：read() 每帧写共享缓存，后台线程原子落盘 `/run/microduck_ext.json`，主机侧 bridge
+//!   复用 SSH 通道拉取——官方代码一行不改。
 //! - 标定：[`bus::Calibration`] 从 TOML 读取（启动默认 `/etc/robot/ft1910.toml`，可用环境变量
 //!   `FT1910_CONFIG` 覆盖；随仓库模板见 `config/ft1910.toml`），含关节方向/零位、PD、IMU
 //!   人格与安装朝向。robotd 开 `ft1910` feature 即选用本后端。
 
 pub mod bus;
+pub mod ext;
 pub mod wire;
 
 pub use bus::{Calibration, Ft1910Io, JointCalibration, Transport};
