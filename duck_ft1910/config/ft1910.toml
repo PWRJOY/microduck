@@ -42,78 +42,87 @@ mouth_kp = 10
 #   zero_ticks 机械零位原始计数（舵机已用 0x0B CAL 把零位烧进内部 EEPROM，恒为 2048）
 #   direction  装配方向：正装 +1 / 反装 −1（2026-09-20 实测，仅 30/31 号颈部/头部俯仰为 +1）
 #   limits     软件行程限位（原始计数，写目标时裁剪）
+#
+# limits 口径（2026-11-17）：当前按仿真关节 range 精确换算的理论窗，未向 range 外推留余量；
+# 计数公式 count = zero + round(rad·direction / (TAU/4096))，clamp 在计数空间做、与 direction 无关。
+# 站姿 DEFAULT / 坐姿 SEAT 常量均已核对落在窗内。定稿前需 torque-off 在站姿、坐姿代表位形
+# 分别扫两端读寄存器 56，取最外沿做位形相关保守包络后再收紧；#32 头 yaw 仿真 ±170° 近全圈，
+# 真实摆角必须单独量，勿照抄宽窗。limits 只裁目标行程，被物理压住时框内目标的跟随误差持续出力
+# 仍需前置姿态判断 + 被压松扭矩兜底。
 
 [[joints]] # 0  left_hip_yaw    (id 20)
 zero_ticks = 2048
 direction = -1
-limits = [0, 4095]
+limits = [1707, 2332]
 
 [[joints]] # 1  left_hip_roll   (id 21)
 zero_ticks = 2048
 direction = -1
-limits = [0, 4095]
+limits = [1798, 2298]
 
 [[joints]] # 2  left_hip_pitch  (id 22)
 zero_ticks = 2048
 direction = -1
-limits = [0, 4095]
+limits = [1024, 3072]
 
 [[joints]] # 3  left_knee       (id 23)
 zero_ticks = 2048
 direction = -1
-limits = [0, 4095]
+limits = [1024, 3072]
 
 [[joints]] # 4  left_ankle      (id 24)
 zero_ticks = 2048
 direction = -1
-limits = [0, 4095]
+limits = [1024, 3072]
 
 [[joints]] # 5  neck_pitch      (id 30)
 zero_ticks = 2048
 direction = 1
-limits = [0, 4095]
+limits = [1024, 2731]
 
 [[joints]] # 6  head_pitch      (id 31)
 zero_ticks = 2048
 direction = 1
-limits = [0, 4095]
+limits = [1024, 3072]
 
 [[joints]] # 7  head_yaw        (id 32)
 zero_ticks = 2048
 direction = -1
-limits = [0, 4095]
+limits = [114, 3982]
 
 [[joints]] # 8  head_roll       (id 33)
 zero_ticks = 2048
 direction = -1
-limits = [0, 4095]
+limits = [1764, 2332]
 
 [[joints]] # 9  mouth           (id 34)
 zero_ticks = 2048
 direction = -1
-limits = [0, 4095]
+# 仿真闭合位为 −5°（model.rs MOUTH_CLOSED），真机闭合机械位在 0°、负向行程到不了；
+# 闭合端按真机 0° 收窄到计数 2048，避免闭嘴目标顶负向堵转；张嘴端 +30°(1707) 保留，待端点实测。
+limits = [1707, 2048]
 
 [[joints]] # 10 right_hip_yaw   (id 10)
 zero_ticks = 2048
 direction = -1
-limits = [0, 4095]
+limits = [1764, 2389]
 
 [[joints]] # 11 right_hip_roll  (id 11)
 zero_ticks = 2048
 direction = -1
-limits = [0, 4095]
+limits = [1798, 2298]
 
 [[joints]] # 12 right_hip_pitch (id 12)
 zero_ticks = 2048
 direction = -1
-limits = [0, 4095]
+limits = [1024, 3072]
 
 [[joints]] # 13 right_knee      (id 13)
 zero_ticks = 2048
 direction = -1
-limits = [0, 4095]
+limits = [1024, 3072]
 
 [[joints]] # 14 right_ankle     (id 14)
 zero_ticks = 2048
 direction = -1
-limits = [0, 4095]
+limits = [1024, 3072]
